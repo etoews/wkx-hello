@@ -148,7 +148,7 @@ jobs:
       # registry-side second opinion (ADR 0025); this in-pipeline Trivy scan is
       # the gate, and it runs before the push so a failing image never lands.
       - name: Trivy scan (deploy gate)
-        uses: aquasecurity/trivy-action@v0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ${{ env.IMAGE }}
           scan-type: image
