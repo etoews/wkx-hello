@@ -97,6 +97,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # TEMPORARY diagnostic: print the OIDC token's non-secret claims (sub/aud)
+      # so we can match the trust policy exactly. Removed once the deploy is green.
+      - name: DEBUG print OIDC claims
+        run: |
+          set -euo pipefail
+          resp=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com")
+          pl=$(printf '%s' "$resp" | jq -r .value | cut -d. -f2)
+          case $((${#pl} % 4)) in 2) pl="$pl==";; 3) pl="$pl=";; esac
+          printf '%s' "$pl" | tr '_-' '/+' | base64 -d 2>/dev/null \
+            | jq '{sub, aud, iss, repository, repository_owner, ref}'
+
       # OIDC only. role-to-assume comes from a masked repository secret, never a
       # committed ARN: wkx-hello is public, so no account id or role ARN lands in
       # this file. No AWS access keys are stored in the repo.
