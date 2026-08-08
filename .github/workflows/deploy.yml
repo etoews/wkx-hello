@@ -1,0 +1,259 @@
+name: CI and deploy
+
+# The single vendored workflow a future wkx-* project copies. It carries two
+# paths in one file:
+#   - pull_request: the Python gate block from python.md, then a native ARM
+#     build only. No AWS access, no push, no deploy. Fork pull requests stay on
+#     this path and never touch credentials.
+#   - push to main: the same gates, then build, Trivy gate, ECR push, deploy
+#     bundle upload, and an SSM-driven deploy that this workflow waits on. A
+#     merge to main deploys hello to prod with nothing manual in between.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Least privilege by default; the deploy job widens this to id-token: write for
+# OIDC. The gate and build jobs only ever read the checkout.
+permissions:
+  contents: read
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        # No version argument: honours .python-version, so CI needs no edit when
+        # the project's Python version moves.
+        run: uv python install
+
+      - name: Install dependencies (fails on a stale lockfile)
+        run: uv sync --locked
+
+      - name: Ruff lint
+        run: uv run ruff check
+
+      - name: Ruff format check
+        run: uv run ruff format --check
+
+      - name: ty type check
+        run: uv run ty check
+
+      - name: pytest
+        run: uv run pytest
+
+  # Pull-request build: native ARM, build only, no push, no AWS. Keeps the PR
+  # path exactly as it was before the deploy path landed.
+  build:
+    needs: gates
+    if: github.event_name == 'pull_request'
+    # Native ARM build on GitHub's stable ARM runner label (ADR 0005), so the
+    # arm64 image is built without QEMU emulation.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build the arm64 image (build only, no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/arm64
+          push: false
+          # provenance and SBOM are OFF deliberately (ADR 0025). Buildx's default
+          # provenance attestation wraps the image in an OCI image index that ECR
+          # silently refuses to scan; disabling both ships a plain, scannable
+          # manifest so ECR (and the pipeline's Trivy gate) can inspect it.
+          provenance: false
+          sbom: false
+
+  # Main-merge deploy: gates, build, scan, push, bundle, then an SSM deploy this
+  # job waits on. Guarded to the push event, so a pull request can never reach
+  # it and fork pull requests never see AWS credentials.
+  deploy:
+    needs: gates
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      id-token: write # OIDC token for the AWS role assume
+      contents: read
+    # One queue per Service and env. Two quick merges queue rather than race, so
+    # the older build never lands last and no in-flight deploy is cancelled.
+    concurrency:
+      group: deploy-hello-prod
+      cancel-in-progress: false
+    env:
+      AWS_REGION: ap-southeast-2
+      IMAGE_SHA: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # OIDC only. role-to-assume comes from a masked repository secret, never a
+      # committed ARN: wkx-hello is public, so no account id or role ARN lands in
+      # this file. No AWS access keys are stored in the repo.
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+
+      # Compute the registry and the deploy bucket from the caller identity, the
+      # same way the Terraform and the on-box deploy script do, so no literal
+      # account id is ever committed (invariant 7).
+      - name: Derive registry and bucket from caller identity
+        run: |
+          set -euo pipefail
+          account=$(aws sts get-caller-identity --query Account --output text)
+          echo "::add-mask::$account"
+          registry="${account}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          echo "REGISTRY=$registry" >> "$GITHUB_ENV"
+          echo "IMAGE=$registry/wkx/hello:${IMAGE_SHA}" >> "$GITHUB_ENV"
+          echo "DEPLOY_BUCKET=wkx-deploy-${account}" >> "$GITHUB_ENV"
+
+      - name: Log in to ECR
+        run: |
+          set -euo pipefail
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | docker login --username AWS --password-stdin "$REGISTRY"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Build the arm64 image and load it into the local Docker so Trivy can scan
+      # the exact artefact before any push. provenance and SBOM off (ADR 0025):
+      # a plain, scannable, single-platform manifest.
+      - name: Build the arm64 image (load locally, no push yet)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/arm64
+          load: true
+          push: false
+          provenance: false
+          sbom: false
+          tags: ${{ env.IMAGE }}
+
+      # The deploy gate. Fails the job (exit-code 1) on a HIGH or CRITICAL that
+      # HAS a fix (ignore-unfixed keeps the gate actionable against un-patchable
+      # base-image noise). ECR scan-on-push stays enabled as an informational
+      # registry-side second opinion (ADR 0025); this in-pipeline Trivy scan is
+      # the gate, and it runs before the push so a failing image never lands.
+      - name: Trivy scan (deploy gate)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.IMAGE }}
+          scan-type: image
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          format: table
+
+      - name: Push the image to ECR
+        run: |
+          set -euo pipefail
+          docker push "$IMAGE"
+
+      # Deploy bundle (ADR 0024): the app's deploy-time files at the tar root.
+      # The deploy script and the M5 render script come from the platform
+      # checkout on the Host, never from the bundle, so only these three travel.
+      # Keyed by the same sha as the image, so image and bundle pair one to one.
+      - name: Build and upload the deploy bundle
+        run: |
+          set -euo pipefail
+          tar czf bundle.tar.gz compose.yml compose.cloud.yml caddy.snippet
+          aws s3 cp bundle.tar.gz \
+            "s3://${DEPLOY_BUCKET}/deploy/hello/${IMAGE_SHA}/bundle.tar.gz"
+
+      # Deploy on the Host and wait for the result. A green workflow means the
+      # Host reported the container healthy and the hostname probe passing, not
+      # merely that the command was sent: deploy.sh exits non-zero on an
+      # unhealthy container or a failed probe, which fails this job.
+      - name: Deploy on the Host via SSM and wait for the result
+        run: |
+          set -euo pipefail
+
+          platform_dir=/home/platform/wkx-platform
+
+          # The script the platform user runs on the Host: refresh the reviewed
+          # main, then hand off to the platform-owned deploy script for exactly
+          # this sha.
+          inner=$(cat <<INNER
+          set -euo pipefail
+          git -C ${platform_dir} fetch --prune
+          git -C ${platform_dir} reset --hard origin/main
+          ${platform_dir}/tools/deploy/deploy.sh --service hello --env prod --tag ${IMAGE_SHA}
+          INNER
+          )
+
+          # base64 so no quoting of the inner script leaks into the SSM document.
+          inner_b64=$(printf '%s' "$inner" | base64 | tr -d '\n')
+
+          # The outer command runs as root under SSM RunCommand. It decodes the
+          # inner script and runs it as the platform user, which owns the
+          # checkout (so git is not blocked by dubious-ownership), is in the
+          # docker group, and gets the snap aws CLI on a login shell's PATH.
+          outer=$(cat <<OUTER
+          f=\$(mktemp /tmp/wkx-deploy.XXXXXX.sh) || exit 1
+          trap 'rm -f "\$f"' EXIT
+          printf '%s' '${inner_b64}' | base64 -d > "\$f" || exit 1
+          chown platform:platform "\$f" || exit 1
+          su - platform -c "bash '\$f'"
+          OUTER
+          )
+
+          params=$(jq -n --arg cmd "$outer" '{commands: [$cmd], executionTimeout: ["900"]}')
+
+          # Target by tag: the instance id is environment-specific and must not
+          # be committed.
+          command_id=$(aws ssm send-command \
+            --document-name AWS-RunShellScript \
+            --comment "wkx-hello deploy prod ${IMAGE_SHA}" \
+            --targets "Key=tag:Name,Values=wkx-host" \
+            --parameters "$params" \
+            --query "Command.CommandId" --output text)
+          echo "Sent deploy command $command_id"
+
+          # Resolve the Host's instance id at run time (never committed) purely
+          # to poll the invocation; the command itself targeted by tag.
+          instance_id=$(aws ssm describe-instance-information \
+            --filters "Key=tag:Name,Values=wkx-host" \
+            --query "InstanceInformationList[0].InstanceId" --output text)
+          if [ -z "$instance_id" ] || [ "$instance_id" = "None" ]; then
+            echo "::error::No SSM-managed Host tagged Name=wkx-host"
+            exit 1
+          fi
+
+          # Poll to a terminal state, and fail the step unless it is Success.
+          deadline=$(( SECONDS + 600 ))
+          while :; do
+            status=$(aws ssm get-command-invocation \
+              --command-id "$command_id" --instance-id "$instance_id" \
+              --query Status --output text 2>/dev/null || echo Pending)
+            case "$status" in
+              Success)
+                echo "Host reports hello is healthy and serving."
+                break
+                ;;
+              Failed | Cancelled | TimedOut)
+                echo "::error::Deploy invocation ended in status $status"
+                aws ssm get-command-invocation \
+                  --command-id "$command_id" --instance-id "$instance_id" \
+                  --query StandardErrorContent --output text || true
+                exit 1
+                ;;
+            esac
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::Timed out after 600s waiting for the deploy invocation (last status: $status)"
+              exit 1
+            fi
+            sleep 5
+          done
