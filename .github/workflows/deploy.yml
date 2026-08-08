@@ -222,13 +222,17 @@ jobs:
             --query "Command.CommandId" --output text)
           echo "Sent deploy command $command_id"
 
-          # Resolve the Host's instance id at run time (never committed) purely
-          # to poll the invocation; the command itself targeted by tag.
-          instance_id=$(aws ssm describe-instance-information \
-            --filters "Key=tag:Name,Values=wkx-host" \
-            --query "InstanceInformationList[0].InstanceId" --output text)
+          # Resolve the target instance from the command's own invocation (no
+          # ssm:DescribeInstanceInformation needed), retrying until it registers.
+          instance_id=""
+          for _ in $(seq 1 12); do
+            instance_id=$(aws ssm list-command-invocations --command-id "$command_id" \
+              --query "CommandInvocations[0].InstanceId" --output text 2>/dev/null || true)
+            [ -n "$instance_id" ] && [ "$instance_id" != "None" ] && break
+            sleep 5
+          done
           if [ -z "$instance_id" ] || [ "$instance_id" = "None" ]; then
-            echo "::error::No SSM-managed Host tagged Name=wkx-host"
+            echo "::error::deploy command $command_id never registered an invocation"
             exit 1
           fi
 
