@@ -43,9 +43,7 @@ def render_page(message: str) -> bytes:
     Returns:
         The UTF-8 encoded HTML body.
     """
-    return (
-        f"<!doctype html>\n<title>hello · wkx</title>\n<h1>{html.escape(message)}</h1>\n".encode()
-    )
+    return f"<!doctype html>\n<title>hello</title>\n<h1>{html.escape(message)}</h1>\n".encode()
 
 
 class Handler(BaseHTTPRequestHandler):
