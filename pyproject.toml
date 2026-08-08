@@ -1,0 +1,49 @@
+[project]
+name = "wkx-hello"
+version = "0.1.0"
+description = "The wkx reference app: a stdlib HTTP server that echoes MESSAGE."
+readme = "README.md"
+requires-python = ">=3.14"
+authors = [{ name = "Everett Toews", email = "everett.toews@gmail.com" }]
+license = { text = "MIT" }
+dependencies = []
+
+[project.scripts]
+wkx-hello = "wkx_hello.app:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/wkx_hello"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-cov>=5",
+    "ruff>=0.8",
+    "ty>=0.0.1",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = []
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "D"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --strict-config"
+filterwarnings = ["error"]
+
+[tool.ty.src]
+include = ["src"]
